@@ -10,12 +10,13 @@ class StopRequested(Exception):
     pass
 
 class Controller:
-    def __init__(self, window_name='异环  ', stop_event=None, recovery_timeout=60):
+    def __init__(self, window_name='异环  ', stop_event=None, recovery_timeout=60, on_screenshot=None):
         self.camera = bettercam.create(output_color="BGR")
         self.camera.start(target_fps=120, video_mode=True)
         self.window_name = window_name
         self.stop_event = stop_event
         self.recovery_timeout = recovery_timeout
+        self.on_screenshot = on_screenshot
         self.last_check_time = 0
         self.last_error_log_time = 0
         self.last_error_message = None
@@ -95,6 +96,15 @@ class Controller:
         except Exception as e:
             self._log_error_throttled(f"Could not bring game window to top: {e}")
 
+    def focus_window(self):
+        if not win32gui.IsWindow(self.hwnd):
+            self._ensure_hwnd()
+
+        focused = self._try_foreground()
+        if focused:
+            logger.info(f"Game window focused: '{self.window_name}'.")
+        return focused
+
     def screenshot(self):
         current_time = time.time()
         
@@ -145,6 +155,11 @@ class Controller:
                 f"Unexpected game window capture size: {cropped.shape[1]}x{cropped.shape[0]}. "
                 "Expected about 1300px wide for 1280x720; continuing anyway."
             )
+        if self.on_screenshot is not None:
+            try:
+                self.on_screenshot(cropped)
+            except Exception as e:
+                self._log_error_throttled(f"Debug screenshot frame callback failed: {e}")
         return cropped
 
     def loop(self, interval=0.1):

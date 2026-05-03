@@ -8,6 +8,7 @@ from modules.controller import Controller, StopRequested
 from modules.fish_bar import FishBar
 from modules.keyboard import Keyboard
 from modules.logger import logger
+from modules.manual_sell import ManualSellError, run_sell_sequence
 from modules.settings import AutomationSettings
 from modules.template import CLICK_BLANK, HOOK
 
@@ -17,6 +18,7 @@ class AutomationRunResult:
     fish_count: int = 0
     golden_fish_count: int = 0
     bait_used_count: int = 0
+    sell_count: int = 0
 
 
 def load_stats(settings):
@@ -78,7 +80,8 @@ def record_error(settings, message):
     logger.error(f"{message} Error count: {stats['errors']}")
 
 
-def wait_for_hook(controller, settings):
+def wait_for_hook(controller, settings, timeout=None, allow_timeout_fallback=True):
+    timeout = settings.hook_wait_timeout if timeout is None else timeout
     logger.info("Waiting for HOOK prompt...")
     start_time = time.time()
     for frame in controller.loop(interval=settings.template_poll_interval):
@@ -86,11 +89,15 @@ def wait_for_hook(controller, settings):
             logger.info("HOOK prompt detected.")
             return True
 
-        if time.time() - start_time >= settings.hook_wait_timeout:
-            logger.warning(
-                f"HOOK prompt not detected after {settings.hook_wait_timeout}s; "
-                "pressing F anyway because invalid F inputs are filtered by the game."
-            )
+        if time.time() - start_time >= timeout:
+            if allow_timeout_fallback:
+                logger.warning(
+                    f"HOOK prompt not detected after {timeout}s; "
+                    "pressing F anyway because invalid F inputs are filtered by the game."
+                )
+                return False
+
+            logger.warning(f"HOOK prompt not detected after {timeout}s.")
             return False
 
 
@@ -164,16 +171,104 @@ def wait_for_click_blank_then_click(controller, settings):
             return None
 
 
-def run_autofish(stop_event, settings=None, on_bait_used=None, on_fish_caught=None):
+def run_autofish(
+    stop_event,
+    settings=None,
+    on_bait_used=None,
+    on_fish_caught=None,
+    on_frame=None,
+    on_auto_sell_remaining=None,
+):
     settings = settings or AutomationSettings()
     run_result = AutomationRunResult()
     controller = None
+    auto_sell_limit = None
+    auto_sell_remaining = None
+    pending_auto_sell = False
+
+    def sync_auto_sell_config():
+        nonlocal auto_sell_limit, auto_sell_remaining, pending_auto_sell
+        configured_limit = settings.auto_sell_after_bait_count
+        if configured_limit == auto_sell_limit:
+            return
+
+        auto_sell_limit = configured_limit
+        pending_auto_sell = False
+        if auto_sell_limit is None:
+            auto_sell_remaining = None
+            logger.info("[SELL] Auto sell by bait count disabled.")
+        else:
+            auto_sell_remaining = auto_sell_limit
+            logger.info(f"[SELL] Auto sell enabled: sell after {auto_sell_limit} bait uses.")
+
+        if on_auto_sell_remaining is not None:
+            on_auto_sell_remaining(auto_sell_remaining)
+
+    def mark_bait_used_for_auto_sell():
+        nonlocal auto_sell_remaining, pending_auto_sell
+        sync_auto_sell_config()
+        if auto_sell_limit is None:
+            return
+
+        auto_sell_remaining = max(0, auto_sell_remaining - 1)
+        logger.info(
+            f"[SELL] Auto sell countdown: remaining bait uses before sell={auto_sell_remaining}."
+        )
+        if on_auto_sell_remaining is not None:
+            on_auto_sell_remaining(auto_sell_remaining)
+
+        if auto_sell_remaining == 0:
+            pending_auto_sell = True
+            logger.info("[SELL] Auto sell scheduled after the current fishing cycle completes.")
+
+    def run_pending_auto_sell_if_needed():
+        nonlocal auto_sell_remaining, pending_auto_sell
+        sync_auto_sell_config()
+        if not pending_auto_sell:
+            return True
+
+        logger.info("[SELL] Auto sell pending. Waiting for HOOK prompt before opening menu.")
+        if not wait_for_hook(
+            controller,
+            settings,
+            timeout=settings.no_recovery_timeout,
+            allow_timeout_fallback=False,
+        ):
+            record_error(
+                settings,
+                "[SELL] HOOK prompt was not detected before auto sell. Stopping this run."
+            )
+            return False
+
+        logger.info("[SELL] Starting auto fish-selling sequence.")
+        try:
+            run_sell_sequence(controller, keyboard)
+        except StopRequested:
+            raise
+        except ManualSellError as e:
+            record_error(settings, f"[SELL] Auto fish-selling workflow failed: {e} Stopping this run.")
+            return False
+        except Exception:
+            logger.exception("[SELL] Auto fish-selling workflow crashed.")
+            record_error(settings, "[SELL] Auto fish-selling workflow crashed. Stopping this run.")
+            return False
+
+        run_result.sell_count += 1
+        pending_auto_sell = False
+        if auto_sell_limit is not None:
+            auto_sell_remaining = auto_sell_limit
+            if on_auto_sell_remaining is not None:
+                on_auto_sell_remaining(auto_sell_remaining)
+        logger.info("[SELL] Auto fish-selling sequence completed; countdown reset.")
+        return True
+
     try:
         logger.info("Initializing controllers...")
         controller = Controller(
             window_name=settings.window_name,
             stop_event=stop_event,
             recovery_timeout=settings.no_recovery_timeout,
+            on_screenshot=on_frame,
         )
         fish_bar = FishBar(controller)
         keyboard = Keyboard()
@@ -182,15 +277,20 @@ def run_autofish(stop_event, settings=None, on_bait_used=None, on_fish_caught=No
         stats = load_stats(settings)
         save_stats(settings, stats)
         logger.info(f"Loaded successful fish count: {stats['successful_fish']}")
+        sync_auto_sell_config()
 
         while not stop_event.is_set():
             try:
+                if not run_pending_auto_sell_if_needed():
+                    break
+
                 wait_for_hook(controller, settings)
                 if not press_f_until_fish_bar(controller, keyboard, fish_bar, settings):
                     break
                 run_result.bait_used_count += 1
                 if on_bait_used is not None:
                     on_bait_used(1)
+                mark_bait_used_for_auto_sell()
                 fish_bar.start()
                 click_blank_wait = wait_for_click_blank_then_click(controller, settings)
                 if click_blank_wait is not None:

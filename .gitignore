@@ -154,6 +154,7 @@ cython_debug/
 
 # Project Specific
 screenshots/
+debug_screenshots/
 logs/*
 !logs/.gitkeep
 *.local.json

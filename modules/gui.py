@@ -8,7 +8,9 @@ from datetime import datetime
 from tkinter import scrolledtext, ttk
 
 from modules.autofish import load_stats, run_autofish
+from modules.debug_screenshot import capture_debug_screenshot, save_debug_screenshot
 from modules.logger import logger
+from modules.manual_sell import run_manual_sell_sequence
 from modules.settings import AutomationSettings
 
 TOGGLE_HOTKEY_LABEL = "` / ·"
@@ -47,6 +49,17 @@ class AutoFishApp:
         self.app_fish_count = 0
         self.app_golden_fish_count = 0
         self.current_bait_count = None
+        self.auto_sell_after_count = None
+        self.auto_sell_remaining_count = None
+        self.f_click_frequency = self.current_settings.f_click_frequency
+        self.f_click_frequency_var = tk.StringVar(value=self._format_frequency(self.f_click_frequency))
+        self.latest_frame = None
+        self.latest_frame_lock = threading.Lock()
+        self.debug_screenshot_worker = None
+        self.manual_sell_worker = None
+        self.debug_window = None
+        self.debug_screenshot_button = None
+        self.manual_sell_button = None
 
         self._build_ui()
         self._refresh_stats_table()
@@ -82,8 +95,11 @@ class AutoFishApp:
         self.toggle_button = ttk.Button(actions, text=f"开始运行  {TOGGLE_HOTKEY_LABEL}", command=self.toggle)
         self.toggle_button.grid(row=0, column=0, padx=(0, 8))
 
+        debug_button = ttk.Button(actions, text="调试", command=self.open_debug_window)
+        debug_button.grid(row=0, column=1, padx=(0, 8))
+
         exit_button = ttk.Button(actions, text="退出  F12", command=self.exit_app)
-        exit_button.grid(row=0, column=1)
+        exit_button.grid(row=0, column=2)
 
         bait_frame = ttk.LabelFrame(self.root, text="鱼饵", padding=(14, 8, 14, 10))
         bait_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
@@ -96,6 +112,20 @@ class AutoFishApp:
         ttk.Button(bait_frame, text="确认", command=self.confirm_bait_count).grid(row=0, column=2, sticky="w", padx=(0, 16))
         ttk.Label(bait_frame, text="已记录").grid(row=0, column=3, sticky="w", padx=(0, 8))
         ttk.Label(bait_frame, textvariable=self.bait_display_var, width=12).grid(row=0, column=4, sticky="w")
+
+        self.auto_sell_after_input_var = tk.StringVar()
+        self.auto_sell_remaining_var = tk.StringVar(value="未启用")
+        ttk.Label(bait_frame, text="钓鱼").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.auto_sell_after_entry = ttk.Entry(bait_frame, textvariable=self.auto_sell_after_input_var, width=10)
+        self.auto_sell_after_entry.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(bait_frame, text="次后卖鱼").grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Button(bait_frame, text="确认", command=self.confirm_auto_sell_count).grid(
+            row=1, column=3, sticky="w", padx=(0, 16), pady=(8, 0)
+        )
+        ttk.Label(bait_frame, text="剩余").grid(row=1, column=4, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(bait_frame, textvariable=self.auto_sell_remaining_var, width=12).grid(
+            row=1, column=5, sticky="w", pady=(8, 0)
+        )
 
         stats_frame = ttk.LabelFrame(self.root, text="统计", padding=(14, 8, 14, 10))
         stats_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
@@ -173,6 +203,60 @@ class AutoFishApp:
         thread = threading.Thread(target=listen, daemon=True)
         thread.start()
 
+    def _format_frequency(self, frequency):
+        return f"{frequency:.2f}"
+
+    def _configure_debug_button(self, name, **options):
+        button = getattr(self, name, None)
+        if button is not None and button.winfo_exists():
+            button.configure(**options)
+
+    def open_debug_window(self):
+        if self.debug_window is not None and self.debug_window.winfo_exists():
+            self.debug_window.lift()
+            self.debug_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.debug_window = window
+        window.title("调试")
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self._close_debug_window)
+
+        content = ttk.Frame(window, padding=(14, 12, 14, 14))
+        content.grid(row=0, column=0, sticky="nsew")
+
+        actions = ttk.LabelFrame(content, text="功能", padding=(12, 8, 12, 10))
+        actions.grid(row=0, column=0, sticky="ew")
+
+        self.debug_screenshot_button = ttk.Button(actions, text="截图", command=self.capture_debug_screenshot)
+        self.debug_screenshot_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self.manual_sell_button = ttk.Button(actions, text="卖鱼", command=self.sell_fish_now)
+        self.manual_sell_button.grid(row=0, column=1, sticky="ew")
+        if self.worker and self.worker.is_alive():
+            self.manual_sell_button.configure(state="disabled")
+
+        settings = ttk.LabelFrame(content, text="设置", padding=(12, 8, 12, 10))
+        settings.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+
+        ttk.Label(settings, text="F 点击频率").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(settings, textvariable=self.f_click_frequency_var, width=10).grid(
+            row=0, column=1, sticky="w", padx=(0, 8)
+        )
+        ttk.Label(settings, text="次/秒").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        ttk.Button(settings, text="确认", command=self.confirm_f_click_frequency).grid(row=0, column=3, sticky="w")
+
+        window.focus_force()
+
+    def _close_debug_window(self):
+        if self.debug_window is not None and self.debug_window.winfo_exists():
+            self.debug_window.destroy()
+        self.debug_window = None
+        self.debug_screenshot_button = None
+        self.manual_sell_button = None
+
     def toggle(self):
         if self.worker and self.worker.is_alive():
             self.stop()
@@ -184,12 +268,19 @@ class AutoFishApp:
             logger.info("Automation is already running.")
             return
 
-        self.current_settings = AutomationSettings()
+        self.current_settings = AutomationSettings(
+            f_click_frequency=self.f_click_frequency,
+            auto_sell_after_bait_count=self.auto_sell_after_count,
+        )
+        if self.auto_sell_after_count is not None:
+            self.auto_sell_remaining_count = self.auto_sell_after_count
+            self.auto_sell_remaining_var.set(str(self.auto_sell_remaining_count))
         self.stop_event.clear()
         self.worker = threading.Thread(target=self._worker_main, daemon=True)
         self.worker.start()
         self.status_var.set("运行中")
         self.toggle_button.configure(text=f"结束运行  {TOGGLE_HOTKEY_LABEL}")
+        self._configure_debug_button("manual_sell_button", state="disabled")
         logger.info(
             f"Automation start requested. F click frequency: "
             f"{self.current_settings.f_click_frequency:.2f}/s."
@@ -228,6 +319,8 @@ class AutoFishApp:
                 settings=self.current_settings,
                 on_bait_used=self._queue_bait_used,
                 on_fish_caught=self._queue_fish_caught,
+                on_frame=self._remember_latest_frame,
+                on_auto_sell_remaining=self._queue_auto_sell_remaining,
             )
         except Exception:
             self.ui_queue.put(("failed", None))
@@ -239,6 +332,65 @@ class AutoFishApp:
 
     def _queue_fish_caught(self, fish_count, golden_fish_count):
         self.ui_queue.put(("fish_caught", (fish_count, golden_fish_count)))
+
+    def _queue_auto_sell_remaining(self, remaining):
+        self.ui_queue.put(("auto_sell_remaining", remaining))
+
+    def _remember_latest_frame(self, frame):
+        with self.latest_frame_lock:
+            self.latest_frame = frame.copy()
+
+    def capture_debug_screenshot(self):
+        if self.debug_screenshot_worker and self.debug_screenshot_worker.is_alive():
+            logger.info("Debug screenshot is already in progress.")
+            return
+
+        self._configure_debug_button("debug_screenshot_button", state="disabled")
+        logger.info("Capturing debug screenshot...")
+        self.debug_screenshot_worker = threading.Thread(target=self._capture_debug_screenshot_worker, daemon=True)
+        self.debug_screenshot_worker.start()
+
+    def _capture_debug_screenshot_worker(self):
+        try:
+            with self.latest_frame_lock:
+                frame = None if self.latest_frame is None else self.latest_frame.copy()
+
+            if frame is not None:
+                path = save_debug_screenshot(frame)
+            else:
+                path = capture_debug_screenshot(self.current_settings)
+
+            self.ui_queue.put(("debug_screenshot_saved", path))
+        except Exception as e:
+            logger.exception("Debug screenshot failed.")
+            self.ui_queue.put(("debug_screenshot_failed", str(e)))
+
+    def sell_fish_now(self):
+        if self.worker and self.worker.is_alive():
+            logger.info("[SELL] Manual fish-selling is disabled while automation is running.")
+            return
+
+        if self.manual_sell_worker and self.manual_sell_worker.is_alive():
+            logger.info("[SELL] Manual fish-selling workflow is already running.")
+            return
+
+        self._configure_debug_button("manual_sell_button", state="disabled")
+        self.status_var.set("正在卖鱼...")
+        self.manual_sell_worker = threading.Thread(target=self._manual_sell_worker_main, daemon=True)
+        self.manual_sell_worker.start()
+
+    def _manual_sell_worker_main(self):
+        try:
+            success = run_manual_sell_sequence(settings=self.current_settings)
+        except Exception:
+            logger.exception("[SELL] Unexpected manual sell worker error.")
+            self.ui_queue.put(("manual_sell_failed", None))
+            return
+
+        if success:
+            self.ui_queue.put(("manual_sell_completed", None))
+        else:
+            self.ui_queue.put(("manual_sell_failed", None))
 
     def _poll_queues(self):
         while True:
@@ -260,22 +412,39 @@ class AutoFishApp:
                 self.app_fish_count += fish_count
                 self.app_golden_fish_count += golden_fish_count
                 self._refresh_stats_table()
+            elif event == "auto_sell_remaining":
+                self._set_auto_sell_remaining(payload)
             elif event == "failed":
                 self.last_ended_at = datetime.now()
                 self._refresh_stats_table()
                 self.status_var.set("运行出错，查看日志")
                 self.toggle_button.configure(text=f"开始运行  {TOGGLE_HOTKEY_LABEL}", state="normal")
+                self._configure_debug_button("manual_sell_button", state="normal")
+            elif event == "debug_screenshot_saved":
+                self.status_var.set("截图已保存")
+                self._configure_debug_button("debug_screenshot_button", state="normal")
+            elif event == "debug_screenshot_failed":
+                self.status_var.set("截图失败，查看日志")
+                self._configure_debug_button("debug_screenshot_button", state="normal")
+            elif event == "manual_sell_completed":
+                self.status_var.set("卖鱼完成")
+                self._configure_debug_button("manual_sell_button", state="normal")
+            elif event == "manual_sell_failed":
+                self.status_var.set("卖鱼失败，查看日志")
+                self._configure_debug_button("manual_sell_button", state="normal")
             elif event == "stopped":
                 self.last_ended_at = datetime.now()
                 if payload is not None:
                     logger.info(
                         f"Run summary: fish={payload.fish_count}, "
                         f"golden_fish={payload.golden_fish_count}, "
-                        f"bait_used={payload.bait_used_count}."
+                        f"bait_used={payload.bait_used_count}, "
+                        f"sell={payload.sell_count}."
                     )
                 self._refresh_stats_table()
                 self.status_var.set("已停止")
                 self.toggle_button.configure(text=f"开始运行  {TOGGLE_HOTKEY_LABEL}", state="normal")
+                self._configure_debug_button("manual_sell_button", state="normal")
 
         self.root.after(80, self._poll_queues)
 
@@ -309,6 +478,54 @@ class AutoFishApp:
         self.bait_display_var.set(str(self.current_bait_count))
         logger.info(f"Bait count confirmed: {self.current_bait_count}.")
 
+    def confirm_auto_sell_count(self):
+        value = self.auto_sell_after_input_var.get().strip()
+        if not value:
+            self.auto_sell_after_count = None
+            self.auto_sell_remaining_count = None
+            self.current_settings.auto_sell_after_bait_count = None
+            self.auto_sell_remaining_var.set("未启用")
+            logger.info("[SELL] Auto sell by bait count disabled.")
+            return
+
+        try:
+            auto_sell_after_count = int(value)
+        except ValueError:
+            logger.error("钓鱼多少次后卖鱼必须是整数。")
+            self.status_var.set("卖鱼次数无效")
+            return
+
+        if auto_sell_after_count <= 0:
+            logger.error("钓鱼多少次后卖鱼必须大于 0。")
+            self.status_var.set("卖鱼次数无效")
+            return
+
+        self.auto_sell_after_count = auto_sell_after_count
+        self.auto_sell_remaining_count = auto_sell_after_count
+        self.current_settings.auto_sell_after_bait_count = auto_sell_after_count
+        self.auto_sell_remaining_var.set(str(self.auto_sell_remaining_count))
+        logger.info(f"[SELL] Auto sell confirmed: sell after {self.auto_sell_after_count} bait uses.")
+
+    def confirm_f_click_frequency(self):
+        value = self.f_click_frequency_var.get().strip()
+        try:
+            frequency = float(value)
+        except ValueError:
+            logger.error("F 点击频率必须是数字。")
+            self.status_var.set("F 点击频率无效")
+            return
+
+        if frequency <= 0:
+            logger.error("F 点击频率必须大于 0。")
+            self.status_var.set("F 点击频率无效")
+            return
+
+        self.f_click_frequency = frequency
+        self.current_settings.f_click_frequency = frequency
+        self.f_click_frequency_var.set(self._format_frequency(frequency))
+        self.status_var.set("F 点击频率已更新")
+        logger.info(f"F click frequency updated: {frequency:.2f}/s.")
+
     def _consume_bait(self, bait_used_count):
         if self.current_bait_count is None or bait_used_count <= 0:
             return
@@ -316,6 +533,13 @@ class AutoFishApp:
         self.current_bait_count = max(0, self.current_bait_count - bait_used_count)
         self.bait_display_var.set(str(self.current_bait_count))
         logger.info(f"Bait count updated: -{bait_used_count}, remaining={self.current_bait_count}.")
+
+    def _set_auto_sell_remaining(self, remaining):
+        self.auto_sell_remaining_count = remaining
+        if remaining is None:
+            self.auto_sell_remaining_var.set("未启用")
+        else:
+            self.auto_sell_remaining_var.set(str(remaining))
 
     def _refresh_stats_table(self):
         stats = load_stats(self.current_settings)

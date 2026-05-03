@@ -61,17 +61,17 @@ class Template:
         else:
             res = cv2.matchTemplate(roi_bin, self.image, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if np.isnan(max_val):
+        if not np.isfinite(max_val):
             return 0, None
 
         return max_val, (x1 + max_loc[0], y1 + max_loc[1])
 
     def match(self, screenshot, offset=10, similarity=0.85):
         max_val, max_pos = self.best_match(screenshot, offset=offset)
-        if not np.isnan(max_val) and max_val >= similarity:
+        if np.isfinite(max_val) and max_val >= similarity:
             logger.debug(f"Matched {self.name}: similarity={max_val:.3f}, pos={max_pos}")
 
-        return not np.isnan(max_val) and max_val >= similarity
+        return np.isfinite(max_val) and max_val >= similarity
 
 
 

@@ -20,4 +20,5 @@ class AutomationSettings:
     f_press_duration: float = 0.05
     template_poll_interval: float = 0.05
     no_recovery_timeout: float = 60
+    auto_sell_after_bait_count: int | None = None
     stats_path: str = os.path.join(APP_DIR, "logs", "stats.json")
