@@ -2,7 +2,7 @@ import numpy as np
 import cv2
 import time
 
-from modules.controller import Controller
+from modules.controller import Controller, StopRequested
 from modules.keyboard import Keyboard
 from modules.logger import logger
 
@@ -74,34 +74,38 @@ class FishBar:
 
     def start(self):
         logger.info("Starting fishing...")
-        self.wait_until_ui_appear()
-        
-        missing_green_bar_count = 0
-        for frame in self.controller.loop(interval=0):
-            green_bar = self._get_green_bar(frame)
-            
-            if green_bar is None:
-                missing_green_bar_count += 1
-                if missing_green_bar_count > 10: # 连续 10 帧检测不到绿条才认为结束
-                    logger.info("Fishing ended.")
-                    break
-                continue
-            
+        try:
+            self.wait_until_ui_appear()
+
             missing_green_bar_count = 0
-            left, right = green_bar
-            cursor = self._get_yellow_cursor(frame)
+            for frame in self.controller.loop(interval=0):
+                green_bar = self._get_green_bar(frame)
 
-            if cursor is None:
-                continue
+                if green_bar is None:
+                    missing_green_bar_count += 1
+                    if missing_green_bar_count > 10: # 连续 10 帧检测不到绿条才认为结束
+                        logger.info("Fishing ended.")
+                        break
+                    continue
 
-            if cursor < left:
-                self._press('d')
-            elif cursor > right:
-                self._press('a')
-            else:
-                self._release_all()
+                missing_green_bar_count = 0
+                left, right = green_bar
+                cursor = self._get_yellow_cursor(frame)
 
-        self._release_all()
+                if cursor is None:
+                    continue
+
+                if cursor < left:
+                    self._press('d')
+                elif cursor > right:
+                    self._press('a')
+                else:
+                    self._release_all()
+        except StopRequested:
+            logger.info("Fishing stopped.")
+            raise
+        finally:
+            self._release_all()
             
 
         

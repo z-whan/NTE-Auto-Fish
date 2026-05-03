@@ -6,21 +6,34 @@ import time
 import random
 from modules.logger import logger
 
+class StopRequested(Exception):
+    pass
+
 class Controller:
-    def __init__(self, window_name='异环  '):
+    def __init__(self, window_name='异环  ', stop_event=None):
         self.camera = bettercam.create(output_color="BGR")
         self.camera.start(target_fps=120, video_mode=True)
         self.window_name = window_name
+        self.stop_event = stop_event
         self.last_check_time = 0
         self.last_error_log_time = 0
         self.last_error_message = None
         self.suppressed_error_count = 0
         self.rect = None
-        self._ensure_hwnd()
-        self._bring_to_top(force_topmost=True)
+        try:
+            self._ensure_hwnd()
+            self._bring_to_top(force_topmost=True)
+        except Exception:
+            self.close()
+            raise
+
+    def _stop_requested(self):
+        return self.stop_event is not None and self.stop_event.is_set()
 
     def _ensure_hwnd(self):
         while True:
+            if self._stop_requested():
+                raise StopRequested("Stop requested while waiting for game window.")
             self.hwnd = win32gui.FindWindow(None, self.window_name)
             if self.hwnd:
                 logger.debug(f"Found window '{self.window_name}' with hwnd {self.hwnd}.")
@@ -123,10 +136,12 @@ class Controller:
         return cropped
 
     def loop(self, interval=0.1):
-        while True:
+        while not self._stop_requested():
             try:
                 s = self.screenshot()
             except ValueError:
+                raise
+            except StopRequested:
                 raise
             except Exception as e:
                 self._log_error_throttled(f"Error during screenshot: {e}")
@@ -134,6 +149,7 @@ class Controller:
                 if s is not None:
                     yield s
             time.sleep(interval)
+        raise StopRequested("Stop requested.")
 
     def mouse_click(self, pos=(650, 700)):
         if not win32gui.IsWindow(self.hwnd):
@@ -153,4 +169,14 @@ class Controller:
         high = seconds * (1 + variance)
         t = sum(random.uniform(low, high) for _ in range(3)) / 3
         logger.debug(f"Sleeping for {t:.3f}s (target: {seconds}s).")
-        time.sleep(t)
+        end_time = time.time() + t
+        while time.time() < end_time:
+            if self._stop_requested():
+                raise StopRequested("Stop requested during sleep.")
+            time.sleep(min(0.05, end_time - time.time()))
+
+    def close(self):
+        try:
+            self.camera.stop()
+        except Exception:
+            pass

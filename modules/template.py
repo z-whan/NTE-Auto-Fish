@@ -2,6 +2,7 @@ import cv2
 import os
 import numpy as np
 from modules.logger import logger
+from modules.settings import APP_DIR
 
 class Template:
     def __init__(self, filename: str, masked=False, search_rect=None):
@@ -64,6 +65,8 @@ class Template:
 
 
 
-TAKE_BAIT = Template("./assets/templates/TAKE_BAIT.png", search_rect=(360, 175, 580, 90))
-HOOK = Template("./assets/templates/HOOK.png", masked=True)
-CLICK_BLANK = Template("./assets/templates/CLICK_BLANK.png")
+TEMPLATE_DIR = os.path.join(APP_DIR, "assets", "templates")
+
+TAKE_BAIT = Template(os.path.join(TEMPLATE_DIR, "TAKE_BAIT.png"), search_rect=(360, 175, 580, 90))
+HOOK = Template(os.path.join(TEMPLATE_DIR, "HOOK.png"), masked=True)
+CLICK_BLANK = Template(os.path.join(TEMPLATE_DIR, "CLICK_BLANK.png"))
