@@ -16,6 +16,7 @@ from modules.template import CLICK_BLANK, HOOK
 class AutomationRunResult:
     fish_count: int = 0
     golden_fish_count: int = 0
+    bait_used_count: int = 0
 
 
 def load_stats(settings):
@@ -104,7 +105,15 @@ def press_f_until_fish_bar(controller, keyboard, fish_bar, settings):
         if fish_bar.is_visible(frame):
             elapsed = time.time() - start_time
             logger.info(f"Fish bar appeared. F clicked {f_click_count} times over {elapsed:.2f}s.")
-            return
+            return True
+
+        if time.time() - start_time >= settings.no_recovery_timeout:
+            record_error(
+                settings,
+                f"Fish bar did not appear after {settings.no_recovery_timeout:.0f}s. "
+                "Stopping this run."
+            )
+            return False
 
         current_time = time.time()
         if current_time - last_press_time >= f_press_interval:
@@ -155,13 +164,17 @@ def wait_for_click_blank_then_click(controller, settings):
             return None
 
 
-def run_autofish(stop_event, settings=None):
+def run_autofish(stop_event, settings=None, on_bait_used=None, on_fish_caught=None):
     settings = settings or AutomationSettings()
     run_result = AutomationRunResult()
     controller = None
     try:
         logger.info("Initializing controllers...")
-        controller = Controller(window_name=settings.window_name, stop_event=stop_event)
+        controller = Controller(
+            window_name=settings.window_name,
+            stop_event=stop_event,
+            recovery_timeout=settings.no_recovery_timeout,
+        )
         fish_bar = FishBar(controller)
         keyboard = Keyboard()
         logger.info("Initialization complete. Waiting for fishing prompts.")
@@ -173,7 +186,11 @@ def run_autofish(stop_event, settings=None):
         while not stop_event.is_set():
             try:
                 wait_for_hook(controller, settings)
-                press_f_until_fish_bar(controller, keyboard, fish_bar, settings)
+                if not press_f_until_fish_bar(controller, keyboard, fish_bar, settings):
+                    break
+                run_result.bait_used_count += 1
+                if on_bait_used is not None:
+                    on_bait_used(1)
                 fish_bar.start()
                 click_blank_wait = wait_for_click_blank_then_click(controller, settings)
                 if click_blank_wait is not None:
@@ -182,13 +199,17 @@ def run_autofish(stop_event, settings=None):
                     run_result.fish_count += 1
                     if is_golden:
                         run_result.golden_fish_count += 1
+                    if on_fish_caught is not None:
+                        on_fish_caught(1, 1 if is_golden else 0)
             except TimeoutError as e:
                 if stop_event.is_set():
                     break
-                record_error(settings, f"{e} Restarting main loop.")
-                click_game_window(controller, "timeout recovery")
+                record_error(settings, f"{e} Stopping this run.")
+                break
     except StopRequested:
         logger.info("Automation stopped.")
+    except TimeoutError as e:
+        record_error(settings, f"{e} Stopping this run.")
     except Exception:
         logger.exception("Automation crashed.")
         raise

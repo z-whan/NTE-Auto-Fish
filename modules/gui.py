@@ -46,6 +46,7 @@ class AutoFishApp:
         self.last_ended_at = None
         self.app_fish_count = 0
         self.app_golden_fish_count = 0
+        self.current_bait_count = None
 
         self._build_ui()
         self._refresh_stats_table()
@@ -62,7 +63,7 @@ class AutoFishApp:
         style.theme_use("clam")
 
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(3, weight=1)
 
         header = ttk.Frame(self.root, padding=(14, 12, 14, 8))
         header.grid(row=0, column=0, sticky="ew")
@@ -84,8 +85,20 @@ class AutoFishApp:
         exit_button = ttk.Button(actions, text="退出  F12", command=self.exit_app)
         exit_button.grid(row=0, column=1)
 
+        bait_frame = ttk.LabelFrame(self.root, text="鱼饵", padding=(14, 8, 14, 10))
+        bait_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+
+        self.bait_input_var = tk.StringVar()
+        self.bait_display_var = tk.StringVar(value="未启用")
+        ttk.Label(bait_frame, text="当前鱼饵数").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.bait_entry = ttk.Entry(bait_frame, textvariable=self.bait_input_var, width=10)
+        self.bait_entry.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Button(bait_frame, text="确认", command=self.confirm_bait_count).grid(row=0, column=2, sticky="w", padx=(0, 16))
+        ttk.Label(bait_frame, text="已记录").grid(row=0, column=3, sticky="w", padx=(0, 8))
+        ttk.Label(bait_frame, textvariable=self.bait_display_var, width=12).grid(row=0, column=4, sticky="w")
+
         stats_frame = ttk.LabelFrame(self.root, text="统计", padding=(14, 8, 14, 10))
-        stats_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        stats_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
 
         self.app_start_var = tk.StringVar()
         self.last_end_var = tk.StringVar()
@@ -103,13 +116,13 @@ class AutoFishApp:
             ("程序总计金色鱼", self.total_golden_var),
         ]
         for index, (label, variable) in enumerate(stats_items):
-            row = index // 3
-            col = (index % 3) * 2
+            row = index // 2
+            col = (index % 2) * 2
             ttk.Label(stats_frame, text=label).grid(row=row, column=col, sticky="w", padx=(0, 8), pady=3)
             ttk.Label(stats_frame, textvariable=variable, width=18).grid(row=row, column=col + 1, sticky="w", padx=(0, 24), pady=3)
 
         log_frame = ttk.Frame(self.root, padding=(14, 4, 14, 14))
-        log_frame.grid(row=2, column=0, sticky="nsew")
+        log_frame.grid(row=3, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
 
@@ -210,11 +223,22 @@ class AutoFishApp:
 
     def _worker_main(self):
         try:
-            run_result = run_autofish(self.stop_event, settings=self.current_settings)
+            run_result = run_autofish(
+                self.stop_event,
+                settings=self.current_settings,
+                on_bait_used=self._queue_bait_used,
+                on_fish_caught=self._queue_fish_caught,
+            )
         except Exception:
             self.ui_queue.put(("failed", None))
         else:
             self.ui_queue.put(("stopped", run_result))
+
+    def _queue_bait_used(self, count):
+        self.ui_queue.put(("bait_used", count))
+
+    def _queue_fish_caught(self, fish_count, golden_fish_count):
+        self.ui_queue.put(("fish_caught", (fish_count, golden_fish_count)))
 
     def _poll_queues(self):
         while True:
@@ -229,7 +253,14 @@ class AutoFishApp:
                 event, payload = self.ui_queue.get_nowait()
             except queue.Empty:
                 break
-            if event == "failed":
+            if event == "bait_used":
+                self._consume_bait(payload)
+            elif event == "fish_caught":
+                fish_count, golden_fish_count = payload
+                self.app_fish_count += fish_count
+                self.app_golden_fish_count += golden_fish_count
+                self._refresh_stats_table()
+            elif event == "failed":
                 self.last_ended_at = datetime.now()
                 self._refresh_stats_table()
                 self.status_var.set("运行出错，查看日志")
@@ -237,11 +268,10 @@ class AutoFishApp:
             elif event == "stopped":
                 self.last_ended_at = datetime.now()
                 if payload is not None:
-                    self.app_fish_count += payload.fish_count
-                    self.app_golden_fish_count += payload.golden_fish_count
                     logger.info(
                         f"Run summary: fish={payload.fish_count}, "
-                        f"golden_fish={payload.golden_fish_count}."
+                        f"golden_fish={payload.golden_fish_count}, "
+                        f"bait_used={payload.bait_used_count}."
                     )
                 self._refresh_stats_table()
                 self.status_var.set("已停止")
@@ -254,6 +284,38 @@ class AutoFishApp:
         self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def confirm_bait_count(self):
+        value = self.bait_input_var.get().strip()
+        if not value:
+            self.current_bait_count = None
+            self.bait_display_var.set("未启用")
+            logger.info("Bait tracking disabled.")
+            return
+
+        try:
+            bait_count = int(value)
+        except ValueError:
+            logger.error("当前鱼饵数必须是整数。")
+            self.status_var.set("鱼饵数无效")
+            return
+
+        if bait_count < 0:
+            logger.error("当前鱼饵数不能小于 0。")
+            self.status_var.set("鱼饵数无效")
+            return
+
+        self.current_bait_count = bait_count
+        self.bait_display_var.set(str(self.current_bait_count))
+        logger.info(f"Bait count confirmed: {self.current_bait_count}.")
+
+    def _consume_bait(self, bait_used_count):
+        if self.current_bait_count is None or bait_used_count <= 0:
+            return
+
+        self.current_bait_count = max(0, self.current_bait_count - bait_used_count)
+        self.bait_display_var.set(str(self.current_bait_count))
+        logger.info(f"Bait count updated: -{bait_used_count}, remaining={self.current_bait_count}.")
 
     def _refresh_stats_table(self):
         stats = load_stats(self.current_settings)

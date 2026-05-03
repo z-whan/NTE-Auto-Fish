@@ -10,15 +10,17 @@ class StopRequested(Exception):
     pass
 
 class Controller:
-    def __init__(self, window_name='异环  ', stop_event=None):
+    def __init__(self, window_name='异环  ', stop_event=None, recovery_timeout=60):
         self.camera = bettercam.create(output_color="BGR")
         self.camera.start(target_fps=120, video_mode=True)
         self.window_name = window_name
         self.stop_event = stop_event
+        self.recovery_timeout = recovery_timeout
         self.last_check_time = 0
         self.last_error_log_time = 0
         self.last_error_message = None
         self.suppressed_error_count = 0
+        self.loop_error_started_at = None
         self.rect = None
         try:
             self._ensure_hwnd()
@@ -31,6 +33,8 @@ class Controller:
         return self.stop_event is not None and self.stop_event.is_set()
 
     def _ensure_hwnd(self):
+        start_time = time.time()
+        logged_waiting = False
         while True:
             if self._stop_requested():
                 raise StopRequested("Stop requested while waiting for game window.")
@@ -39,7 +43,14 @@ class Controller:
                 logger.debug(f"Found window '{self.window_name}' with hwnd {self.hwnd}.")
                 break
             else:
-                logger.warning(f"Window '{self.window_name}' not found, waiting...")
+                if not logged_waiting:
+                    logger.warning(
+                        f"Window '{self.window_name}' not found. "
+                        f"Waiting up to {self.recovery_timeout:.0f}s before stopping this run."
+                    )
+                    logged_waiting = True
+                if time.time() - start_time >= self.recovery_timeout:
+                    raise TimeoutError(f"Window '{self.window_name}' not found after {self.recovery_timeout:.0f}s.")
                 time.sleep(1)
 
     def _log_error_throttled(self, message, interval=5):
@@ -142,12 +153,21 @@ class Controller:
                 s = self.screenshot()
             except ValueError:
                 raise
+            except TimeoutError:
+                raise
             except StopRequested:
                 raise
             except Exception as e:
+                if self.loop_error_started_at is None:
+                    self.loop_error_started_at = time.time()
                 self._log_error_throttled(f"Error during screenshot: {e}")
+                if time.time() - self.loop_error_started_at >= self.recovery_timeout:
+                    raise TimeoutError(
+                        f"Screenshot failed for {self.recovery_timeout:.0f}s; stopping this run."
+                    )
             else:
                 if s is not None:
+                    self.loop_error_started_at = None
                     yield s
             time.sleep(interval)
         raise StopRequested("Stop requested.")
