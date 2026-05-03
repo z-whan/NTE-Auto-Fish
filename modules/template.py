@@ -29,13 +29,13 @@ class Template:
 
     def __str__(self):
         return self.name
-    
-    def match(self, screenshot, offset=10, similarity=0.85):
+
+    def best_match(self, screenshot, offset=10):
         if screenshot is None or self.image is None:
-            return False
-            
+            return 0, None
+
         x, y, w, h = self.rect
-        
+
         h_img, w_img = screenshot.shape[:2]
         if self.search_rect:
             sx, sy, sw, sh = self.search_rect
@@ -48,19 +48,29 @@ class Template:
             y1 = max(0, y - offset)
             x2 = min(w_img, x + w + offset)
             y2 = min(h_img, y + h + offset)
-        
+
         roi = screenshot[y1:y2, x1:x2]
+        if roi.size == 0:
+            return 0, None
+
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         _, roi_bin = cv2.threshold(roi_gray, 200, 255, cv2.THRESH_BINARY)
-            
+
         if self.masked:
             res = cv2.matchTemplate(roi_bin, self.image, cv2.TM_CCORR_NORMED, mask=self.mask)
         else:
             res = cv2.matchTemplate(roi_bin, self.image, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if np.isnan(max_val):
+            return 0, None
+
+        return max_val, (x1 + max_loc[0], y1 + max_loc[1])
+
+    def match(self, screenshot, offset=10, similarity=0.85):
+        max_val, max_pos = self.best_match(screenshot, offset=offset)
         if not np.isnan(max_val) and max_val >= similarity:
-            logger.debug(f"Matched {self.name}: similarity={max_val:.3f}, pos=({x1 + max_loc[0]}, {y1 + max_loc[1]})")
-        
+            logger.debug(f"Matched {self.name}: similarity={max_val:.3f}, pos={max_pos}")
+
         return not np.isnan(max_val) and max_val >= similarity
 
 
@@ -69,4 +79,7 @@ TEMPLATE_DIR = os.path.join(APP_DIR, "assets", "templates")
 
 TAKE_BAIT = Template(os.path.join(TEMPLATE_DIR, "TAKE_BAIT.png"), search_rect=(360, 175, 580, 90))
 HOOK = Template(os.path.join(TEMPLATE_DIR, "HOOK.png"), masked=True)
-CLICK_BLANK = Template(os.path.join(TEMPLATE_DIR, "CLICK_BLANK.png"))
+CLICK_BLANK = Template(
+    os.path.join(TEMPLATE_DIR, "CLICK_BLANK.png"),
+    search_rect=(360, 625, 580, 95),
+)

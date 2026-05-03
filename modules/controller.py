@@ -102,14 +102,12 @@ class Controller:
             screen_h = self.camera.height
 
             is_out_of_screen = (left < 0 or top < 0 or right > screen_w or bottom > screen_h)
-            
+
             if is_out_of_screen:
-                logger.debug(f"Window is out of screen (rect: {rect}), moving to center.")
-                new_x = (screen_w - w) // 2
-                new_y = (screen_h - h) // 2
-                win32gui.SetWindowPos(self.hwnd, win32con.HWND_TOP, new_x, new_y, 0, 0, win32con.SWP_NOSIZE)
-                time.sleep(0.2)
-                rect = win32gui.GetWindowRect(self.hwnd)
+                self._log_error_throttled(
+                    f"Game window is partially outside the capture area (rect: {rect}); "
+                    "keeping its current position."
+                )
 
             self.rect = rect
             self.last_check_time = time.time()
@@ -132,7 +130,10 @@ class Controller:
 
         cropped = frame[top:bottom, left:right]
         if cropped.shape[1] < 1290 or cropped.shape[1] > 1310:
-            raise ValueError("窗口尺寸不支持。请确保游戏分辨率设置为 1280x720。")
+            self._log_error_throttled(
+                f"Unexpected game window capture size: {cropped.shape[1]}x{cropped.shape[0]}. "
+                "Expected about 1300px wide for 1280x720; continuing anyway."
+            )
         return cropped
 
     def loop(self, interval=0.1):

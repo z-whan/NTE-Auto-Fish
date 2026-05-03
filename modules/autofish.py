@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 from modules.controller import Controller, StopRequested
@@ -8,22 +9,40 @@ from modules.fish_bar import FishBar
 from modules.keyboard import Keyboard
 from modules.logger import logger
 from modules.settings import AutomationSettings
-from modules.template import CLICK_BLANK, HOOK, TAKE_BAIT
+from modules.template import CLICK_BLANK, HOOK
+
+
+@dataclass
+class AutomationRunResult:
+    fish_count: int = 0
+    golden_fish_count: int = 0
 
 
 def load_stats(settings):
+    default_stats = {
+        "successful_fish": 0,
+        "golden_fish": 0,
+        "last_success_at": None,
+        "last_golden_at": None,
+    }
+
     if not os.path.exists(settings.stats_path):
-        return {"successful_fish": 0, "last_success_at": None}
+        return default_stats
 
     try:
         with open(settings.stats_path, "r", encoding="utf-8") as f:
             stats = json.load(f)
     except (OSError, json.JSONDecodeError):
         logger.warning("Failed to load stats.json; starting from zero.")
-        return {"successful_fish": 0, "last_success_at": None}
+        return default_stats
 
     stats.setdefault("successful_fish", 0)
+    stats.setdefault("golden_fish", 0)
     stats.setdefault("last_success_at", None)
+    stats.setdefault("last_golden_at", None)
+    stats.setdefault("errors", 0)
+    stats.setdefault("last_error_at", None)
+    stats.setdefault("last_error", None)
     return stats
 
 
@@ -33,66 +52,112 @@ def save_stats(settings, stats):
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
 
-def record_successful_fish(settings):
+def record_successful_fish(settings, is_golden=False, click_blank_wait=None):
     stats = load_stats(settings)
     stats["successful_fish"] += 1
     stats["last_success_at"] = datetime.now().isoformat(timespec="seconds")
+    if is_golden:
+        stats["golden_fish"] += 1
+        stats["last_golden_at"] = stats["last_success_at"]
     save_stats(settings, stats)
+    if is_golden:
+        logger.info(
+            f"Golden fish detected. CLICK_BLANK wait={click_blank_wait:.2f}s, "
+            f"golden fish count: {stats['golden_fish']}."
+        )
     logger.info(f"Successful fish count: {stats['successful_fish']}")
 
 
-def wait_until_appear(controller, template, timeout, interval=0.1, post_match_delay=0.1):
-    logger.debug(f"Waiting for {template} with timeout {timeout}s...")
-    start_time = time.time()
-    for frame in controller.loop(interval=interval):
-        if template.match(frame):
-            logger.debug(f"Found {template}.")
-            if post_match_delay > 0:
-                controller.sleep(post_match_delay)
-            return
-        if time.time() - start_time > timeout:
-            logger.warning(f"Wait for {template} timeout after {timeout}s.")
-            raise TimeoutError(f"Wait for {template} failed after {timeout}s.")
+def record_error(settings, message):
+    stats = load_stats(settings)
+    stats["errors"] += 1
+    stats["last_error_at"] = datetime.now().isoformat(timespec="seconds")
+    stats["last_error"] = message
+    save_stats(settings, stats)
+    logger.error(f"{message} Error count: {stats['errors']}")
 
 
-def try_wait_until_appear(controller, template, timeout, interval=0.03, post_match_delay=0):
-    logger.debug(f"Quick waiting for {template} with timeout {timeout}s...")
+def wait_for_hook(controller, settings):
+    logger.info("Waiting for HOOK prompt...")
     start_time = time.time()
-    for frame in controller.loop(interval=interval):
-        if template.match(frame):
-            logger.debug(f"Found {template}.")
-            if post_match_delay > 0:
-                controller.sleep(post_match_delay)
+    for frame in controller.loop(interval=settings.template_poll_interval):
+        if HOOK.match(frame):
+            logger.info("HOOK prompt detected.")
             return True
-        if time.time() - start_time > timeout:
+
+        if time.time() - start_time >= settings.hook_wait_timeout:
+            logger.warning(
+                f"HOOK prompt not detected after {settings.hook_wait_timeout}s; "
+                "pressing F anyway because invalid F inputs are filtered by the game."
+            )
             return False
-    return False
 
 
-def close_result_screen(controller, settings):
-    logger.info("Closing result screen...")
+def press_f_until_fish_bar(controller, keyboard, fish_bar, settings):
+    logger.info("Pressing F until fish bar appears...")
+    f_press_interval = 1 / max(settings.f_click_frequency, 0.1)
+    last_press_time = 0
     start_time = time.time()
-    last_click_time = 0
+    f_click_count = 0
 
-    while time.time() - start_time <= settings.settle_screen_timeout:
-        for frame in controller.loop(interval=0.05):
-            current_time = time.time()
-            if HOOK.match(frame):
-                logger.info("Result screen closed; ready for next cast.")
-                return True
+    for frame in controller.loop(interval=settings.template_poll_interval):
+        if fish_bar.is_visible(frame):
+            elapsed = time.time() - start_time
+            logger.info(f"Fish bar appeared. F clicked {f_click_count} times over {elapsed:.2f}s.")
+            return
 
-            if current_time - last_click_time >= settings.settle_click_interval:
-                controller.mouse_click()
-                last_click_time = current_time
+        current_time = time.time()
+        if current_time - last_press_time >= f_press_interval:
+            keyboard.click("f", duration=settings.f_press_duration)
+            f_click_count += 1
+            last_press_time = current_time
 
-            if current_time - start_time > settings.settle_screen_timeout:
-                logger.warning("Result screen did not close in time; restarting main loop.")
-                return False
-    return False
+
+def click_game_window(controller, reason):
+    logger.info(f"Mouse click in game window: {reason}")
+    controller.mouse_click()
+
+
+def wait_for_click_blank_then_click(controller, settings):
+    logger.info(f"Waiting for CLICK_BLANK prompt for up to {settings.click_blank_timeout}s...")
+    start_time = time.time()
+    matched_frames = 0
+    best_score = 0
+    best_pos = None
+
+    for frame in controller.loop(interval=settings.template_poll_interval):
+        elapsed = time.time() - start_time
+        score, pos = CLICK_BLANK.best_match(frame)
+        if score > best_score:
+            best_score = score
+            best_pos = pos
+
+        if elapsed >= settings.click_blank_min_wait and score >= settings.click_blank_similarity:
+            matched_frames += 1
+        else:
+            matched_frames = 0
+
+        if matched_frames >= settings.click_blank_confirm_frames:
+            confirmed_wait = time.time() - start_time
+            logger.info(
+                f"CLICK_BLANK prompt confirmed. Clicking game window. "
+                f"score={score:.3f}, pos={pos}, frames={matched_frames}, "
+                f"wait={confirmed_wait:.2f}s."
+            )
+            click_game_window(controller, "CLICK_BLANK confirmed")
+            return confirmed_wait
+
+        if elapsed >= settings.click_blank_timeout:
+            message = "CLICK_BLANK prompt timeout. Clicking game window and restarting."
+            logger.warning(f"Best CLICK_BLANK match before timeout: score={best_score:.3f}, pos={best_pos}.")
+            click_game_window(controller, "CLICK_BLANK timeout fallback")
+            record_error(settings, message)
+            return None
 
 
 def run_autofish(stop_event, settings=None):
     settings = settings or AutomationSettings()
+    run_result = AutomationRunResult()
     controller = None
     try:
         logger.info("Initializing controllers...")
@@ -107,27 +172,21 @@ def run_autofish(stop_event, settings=None):
 
         while not stop_event.is_set():
             try:
-                wait_until_appear(controller, HOOK, 3)
-                logger.info("Spinning rod...")
-                keyboard.click("f")
-
-                wait_until_appear(controller, TAKE_BAIT, 10)
-                logger.info("Taking bait...")
-                keyboard.click("f")
+                wait_for_hook(controller, settings)
+                press_f_until_fish_bar(controller, keyboard, fish_bar, settings)
                 fish_bar.start()
-                record_successful_fish(settings)
-
-                if try_wait_until_appear(controller, CLICK_BLANK, settings.click_blank_fast_timeout):
-                    logger.info("Clicking blank after detecting prompt...")
-                else:
-                    logger.info("CLICK_BLANK prompt not detected quickly; clicking blank as fallback...")
-                controller.mouse_click()
-                close_result_screen(controller, settings)
+                click_blank_wait = wait_for_click_blank_then_click(controller, settings)
+                if click_blank_wait is not None:
+                    is_golden = click_blank_wait >= settings.golden_fish_wait_threshold
+                    record_successful_fish(settings, is_golden, click_blank_wait)
+                    run_result.fish_count += 1
+                    if is_golden:
+                        run_result.golden_fish_count += 1
             except TimeoutError as e:
                 if stop_event.is_set():
                     break
-                controller.mouse_click()
-                logger.warning(f"{e} Restarting main loop.")
+                record_error(settings, f"{e} Restarting main loop.")
+                click_game_window(controller, "timeout recovery")
     except StopRequested:
         logger.info("Automation stopped.")
     except Exception:
@@ -136,3 +195,4 @@ def run_autofish(stop_event, settings=None):
     finally:
         if controller is not None:
             controller.close()
+    return run_result

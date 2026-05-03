@@ -15,7 +15,7 @@ class FishBar:
         self.controller = controller
         self.keyboard = Keyboard()
         self.current_key = None
-    
+
     def _get_green_bar(self, screenshot):
         x, y, w, h = self.RECT
         roi = screenshot[y:y+h, x:x+w]
@@ -39,17 +39,20 @@ class FishBar:
         target = np.array(self.YELLOW_CURSOR, dtype=np.int16)
         dist = np.sum(np.abs(roi.astype(np.int16) - target), axis=2)
         
-        threshold = 10 
+        threshold = 10
         mask = dist < threshold
         cols = np.where(np.any(mask, axis=0))[0]
         if cols.size > 0:
             return int((cols[0] + cols[-1]) // 2 + x)
         return None
 
+    def is_visible(self, screenshot):
+        return self._get_green_bar(screenshot) is not None and self._get_yellow_cursor(screenshot) is not None
+
     def _press(self, key):
         if self.current_key == key:
             return
-        
+
         self._release_all()
         if key:
             logger.debug(f"Pressing '{key}'")
@@ -66,7 +69,7 @@ class FishBar:
         logger.debug("Waiting for fish bar UI to appear...")
         start_time = time.time()
         for frame in self.controller.loop():
-            if self._get_green_bar(frame) is not None and self._get_yellow_cursor(frame) is not None:
+            if self.is_visible(frame):
                 logger.debug("Fish bar UI appeared.")
                 return
             if time.time() - start_time > timeout:
@@ -74,17 +77,24 @@ class FishBar:
 
     def start(self):
         logger.info("Starting fishing...")
+        start_time = time.time()
+        frame_count = 0
+        missing_green_bar_count = 0
         try:
             self.wait_until_ui_appear()
 
-            missing_green_bar_count = 0
             for frame in self.controller.loop(interval=0):
+                frame_count += 1
                 green_bar = self._get_green_bar(frame)
 
                 if green_bar is None:
                     missing_green_bar_count += 1
-                    if missing_green_bar_count > 10: # 连续 10 帧检测不到绿条才认为结束
-                        logger.info("Fishing ended.")
+                    if missing_green_bar_count > 10:
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f"Fishing ended after green bar disappeared. "
+                            f"duration={elapsed:.2f}s, frames={frame_count}."
+                        )
                         break
                     continue
 
@@ -106,6 +116,3 @@ class FishBar:
             raise
         finally:
             self._release_all()
-            
-
-        

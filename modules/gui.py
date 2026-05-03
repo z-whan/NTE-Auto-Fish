@@ -4,10 +4,12 @@ import queue
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from tkinter import scrolledtext, ttk
 
-from modules.autofish import run_autofish
+from modules.autofish import load_stats, run_autofish
 from modules.logger import logger
+from modules.settings import AutomationSettings
 
 TOGGLE_HOTKEY_LABEL = "` / ·"
 VK_TOGGLE = 0xC0
@@ -39,8 +41,14 @@ class AutoFishApp:
         self.ui_queue = queue.Queue()
         self.hotkey_stop = threading.Event()
         self.exiting = False
+        self.current_settings = AutomationSettings()
+        self.app_started_at = datetime.now()
+        self.last_ended_at = None
+        self.app_fish_count = 0
+        self.app_golden_fish_count = 0
 
         self._build_ui()
+        self._refresh_stats_table()
         self._attach_logger()
         self._bind_shortcuts()
         self._start_hotkey_listener()
@@ -54,7 +62,7 @@ class AutoFishApp:
         style.theme_use("clam")
 
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
         header = ttk.Frame(self.root, padding=(14, 12, 14, 8))
         header.grid(row=0, column=0, sticky="ew")
@@ -76,8 +84,32 @@ class AutoFishApp:
         exit_button = ttk.Button(actions, text="退出  F12", command=self.exit_app)
         exit_button.grid(row=0, column=1)
 
+        stats_frame = ttk.LabelFrame(self.root, text="统计", padding=(14, 8, 14, 10))
+        stats_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+
+        self.app_start_var = tk.StringVar()
+        self.last_end_var = tk.StringVar()
+        self.app_fish_var = tk.StringVar()
+        self.app_golden_var = tk.StringVar()
+        self.total_fish_var = tk.StringVar()
+        self.total_golden_var = tk.StringVar()
+
+        stats_items = [
+            ("程序打开时间", self.app_start_var),
+            ("最近结束时间", self.last_end_var),
+            ("本次打开钓鱼数", self.app_fish_var),
+            ("本次打开金色鱼", self.app_golden_var),
+            ("程序总计钓鱼数", self.total_fish_var),
+            ("程序总计金色鱼", self.total_golden_var),
+        ]
+        for index, (label, variable) in enumerate(stats_items):
+            row = index // 3
+            col = (index % 3) * 2
+            ttk.Label(stats_frame, text=label).grid(row=row, column=col, sticky="w", padx=(0, 8), pady=3)
+            ttk.Label(stats_frame, textvariable=variable, width=18).grid(row=row, column=col + 1, sticky="w", padx=(0, 24), pady=3)
+
         log_frame = ttk.Frame(self.root, padding=(14, 4, 14, 14))
-        log_frame.grid(row=1, column=0, sticky="nsew")
+        log_frame.grid(row=2, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
 
@@ -139,12 +171,16 @@ class AutoFishApp:
             logger.info("Automation is already running.")
             return
 
+        self.current_settings = AutomationSettings()
         self.stop_event.clear()
         self.worker = threading.Thread(target=self._worker_main, daemon=True)
         self.worker.start()
         self.status_var.set("运行中")
         self.toggle_button.configure(text=f"结束运行  {TOGGLE_HOTKEY_LABEL}")
-        logger.info("Automation start requested.")
+        logger.info(
+            f"Automation start requested. F click frequency: "
+            f"{self.current_settings.f_click_frequency:.2f}/s."
+        )
 
     def stop(self):
         if not self.worker or not self.worker.is_alive():
@@ -174,11 +210,11 @@ class AutoFishApp:
 
     def _worker_main(self):
         try:
-            run_autofish(self.stop_event)
+            run_result = run_autofish(self.stop_event, settings=self.current_settings)
         except Exception:
             self.ui_queue.put(("failed", None))
         else:
-            self.ui_queue.put(("stopped", None))
+            self.ui_queue.put(("stopped", run_result))
 
     def _poll_queues(self):
         while True:
@@ -190,13 +226,24 @@ class AutoFishApp:
 
         while True:
             try:
-                event, _payload = self.ui_queue.get_nowait()
+                event, payload = self.ui_queue.get_nowait()
             except queue.Empty:
                 break
             if event == "failed":
+                self.last_ended_at = datetime.now()
+                self._refresh_stats_table()
                 self.status_var.set("运行出错，查看日志")
                 self.toggle_button.configure(text=f"开始运行  {TOGGLE_HOTKEY_LABEL}", state="normal")
             elif event == "stopped":
+                self.last_ended_at = datetime.now()
+                if payload is not None:
+                    self.app_fish_count += payload.fish_count
+                    self.app_golden_fish_count += payload.golden_fish_count
+                    logger.info(
+                        f"Run summary: fish={payload.fish_count}, "
+                        f"golden_fish={payload.golden_fish_count}."
+                    )
+                self._refresh_stats_table()
                 self.status_var.set("已停止")
                 self.toggle_button.configure(text=f"开始运行  {TOGGLE_HOTKEY_LABEL}", state="normal")
 
@@ -207,3 +254,14 @@ class AutoFishApp:
         self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _refresh_stats_table(self):
+        stats = load_stats(self.current_settings)
+        self.app_start_var.set(self.app_started_at.strftime("%Y-%m-%d %H:%M:%S"))
+        self.last_end_var.set(
+            self.last_ended_at.strftime("%Y-%m-%d %H:%M:%S") if self.last_ended_at else "-"
+        )
+        self.app_fish_var.set(str(self.app_fish_count))
+        self.app_golden_var.set(str(self.app_golden_fish_count))
+        self.total_fish_var.set(str(stats.get("successful_fish", 0)))
+        self.total_golden_var.set(str(stats.get("golden_fish", 0)))
