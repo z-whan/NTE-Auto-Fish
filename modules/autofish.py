@@ -173,6 +173,7 @@ def wait_for_click_blank_then_click(controller, settings):
 
 def run_autofish(
     stop_event,
+    graceful_stop_event=None,
     settings=None,
     on_bait_used=None,
     on_fish_caught=None,
@@ -281,10 +282,18 @@ def run_autofish(
 
         while not stop_event.is_set():
             try:
+                if graceful_stop_event is not None and graceful_stop_event.is_set():
+                    logger.info("Graceful stop requested. Stopping before starting the next fishing cycle.")
+                    break
+
                 if not run_pending_auto_sell_if_needed():
                     break
 
                 wait_for_hook(controller, settings)
+                if graceful_stop_event is not None and graceful_stop_event.is_set():
+                    logger.info("Graceful stop requested after HOOK prompt; not starting a new fishing cycle.")
+                    break
+
                 if not press_f_until_fish_bar(controller, keyboard, fish_bar, settings):
                     break
                 run_result.bait_used_count += 1

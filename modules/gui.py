@@ -38,6 +38,7 @@ class AutoFishApp:
         self.root.minsize(720, 420)
 
         self.stop_event = threading.Event()
+        self.graceful_stop_event = threading.Event()
         self.worker = None
         self.log_queue = queue.Queue()
         self.ui_queue = queue.Queue()
@@ -60,6 +61,7 @@ class AutoFishApp:
         self.debug_window = None
         self.debug_screenshot_button = None
         self.manual_sell_button = None
+        self.last_toggle_hotkey_at = 0
 
         self._build_ui()
         self._refresh_stats_table()
@@ -180,14 +182,13 @@ class AutoFishApp:
         self.gui_log_handler = handler
 
     def _bind_shortcuts(self):
-        self.root.bind("<grave>", lambda _event: self.toggle())
         self.root.bind("<F12>", lambda _event: self.exit_app())
 
     def _start_hotkey_listener(self):
         def listen():
             pressed = set()
             hotkeys = {
-                VK_TOGGLE: self.toggle,
+                VK_TOGGLE: self.toggle_hotkey,
                 VK_EXIT: self.exit_app,
             }
             while not self.hotkey_stop.is_set():
@@ -202,6 +203,14 @@ class AutoFishApp:
 
         thread = threading.Thread(target=listen, daemon=True)
         thread.start()
+
+    def toggle_hotkey(self):
+        current_time = time.time()
+        if current_time - self.last_toggle_hotkey_at < 0.12:
+            return
+
+        self.last_toggle_hotkey_at = current_time
+        self.toggle()
 
     def _format_frequency(self, frequency):
         return f"{frequency:.2f}"
@@ -276,6 +285,7 @@ class AutoFishApp:
             self.auto_sell_remaining_count = self.auto_sell_after_count
             self.auto_sell_remaining_var.set(str(self.auto_sell_remaining_count))
         self.stop_event.clear()
+        self.graceful_stop_event.clear()
         self.worker = threading.Thread(target=self._worker_main, daemon=True)
         self.worker.start()
         self.status_var.set("运行中")
@@ -291,10 +301,17 @@ class AutoFishApp:
             logger.info("Automation is not running.")
             return
 
+        if not self.graceful_stop_event.is_set():
+            self.graceful_stop_event.set()
+            self.status_var.set("本轮结束后停止...")
+            self.toggle_button.configure(text=f"立即结束  {TOGGLE_HOTKEY_LABEL}", state="normal")
+            logger.info("Graceful automation stop requested. Press the toggle again to stop immediately.")
+            return
+
         self.stop_event.set()
-        self.status_var.set("正在停止...")
+        self.status_var.set("正在立即停止...")
         self.toggle_button.configure(state="disabled")
-        logger.info("Automation stop requested.")
+        logger.info("Immediate automation stop requested.")
 
     def exit_app(self):
         if self.exiting and self.worker and self.worker.is_alive():
@@ -305,6 +322,7 @@ class AutoFishApp:
         self.hotkey_stop.set()
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
+            self.graceful_stop_event.set()
             logger.info("Stopping automation before exit...")
             self.root.after(150, self.exit_app)
             return
@@ -316,6 +334,7 @@ class AutoFishApp:
         try:
             run_result = run_autofish(
                 self.stop_event,
+                graceful_stop_event=self.graceful_stop_event,
                 settings=self.current_settings,
                 on_bait_used=self._queue_bait_used,
                 on_fish_caught=self._queue_fish_caught,
@@ -416,6 +435,8 @@ class AutoFishApp:
                 self._set_auto_sell_remaining(payload)
             elif event == "failed":
                 self.last_ended_at = datetime.now()
+                self.stop_event.clear()
+                self.graceful_stop_event.clear()
                 self._refresh_stats_table()
                 self.status_var.set("运行出错，查看日志")
                 self.toggle_button.configure(text=f"开始运行  {TOGGLE_HOTKEY_LABEL}", state="normal")
@@ -434,6 +455,8 @@ class AutoFishApp:
                 self._configure_debug_button("manual_sell_button", state="normal")
             elif event == "stopped":
                 self.last_ended_at = datetime.now()
+                self.stop_event.clear()
+                self.graceful_stop_event.clear()
                 if payload is not None:
                     logger.info(
                         f"Run summary: fish={payload.fish_count}, "
